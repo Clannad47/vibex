@@ -110,6 +110,9 @@ use vibex_db::{
     open_database,
 };
 
+use crate::adapter_activation::{
+    AcpAdapterArtifactObservation, VerifiedAcpAdapterActivation, read_activation_evidence,
+};
 use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
 use crate::claude::{claude_config_home, find_claude_transcript};
 use crate::claude_session;
@@ -136,8 +139,8 @@ use crate::protocol::{
     self, AcpDecodedPayload, AcpOperation, AcpOperationStability, AcpWireEncoding, CapabilitySource,
 };
 use crate::registry::{
-    AcpCompatibilityRegistry, AgentEventEnricherKind, CLAUDE_AGENT_ID, CODEX_AGENT_ID,
-    CapabilitySupport, ModelSelectionStrategy, RestorePolicy, TranscriptStrategy,
+    AcpAgentCompatibility, AcpCompatibilityRegistry, AgentEventEnricherKind, CLAUDE_AGENT_ID,
+    CODEX_AGENT_ID, CapabilitySupport, ModelSelectionStrategy, RestorePolicy, TranscriptStrategy,
     known_reasoning_effort_values, known_session_mode_values,
 };
 use crate::session_attachment_registry::{
@@ -7917,6 +7920,34 @@ struct EffectiveAdapterIdentity {
     compatibility_identity: String,
     exact_descriptor: bool,
     event_enricher: AgentEventEnricherKind,
+    /// Why a pinned managed adapter did or did not unlock its exact descriptor.
+    activation: AcpAdapterActivationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AcpAdapterActivationState {
+    /// The descriptor identity, the recorded evidence, and the installed
+    /// artifact all agree.
+    Verified,
+    /// The descriptor exists for this exact version but the installation could
+    /// not prove it. The code is the stable rejection reason.
+    Unverified { code: String },
+    /// This route is not a pinned managed baseline (unmanaged command, a
+    /// version ahead of the compiled descriptor, or no descriptor at all).
+    NotApplicable,
+}
+
+/// Verifies one pinned managed adapter against its descriptor using only local
+/// files: recorded evidence, then the artifact observed now. No process is
+/// spawned, no network is touched, and no credential is read.
+fn verify_managed_activation(
+    descriptor: &AcpAgentCompatibility,
+    install_root: &Path,
+) -> VibexResult<()> {
+    let evidence = read_activation_evidence(install_root)?;
+    let observed = AcpAdapterArtifactObservation::observe(install_root, &evidence)?;
+    VerifiedAcpAdapterActivation::verify_installed(descriptor, &evidence, &observed)?;
+    Ok(())
 }
 
 /// Concrete ACP adapter for the provider-neutral durable runtime-switch
@@ -11019,31 +11050,58 @@ impl AcpRuntimeClient {
             command: config.command.clone(),
             args: config.args.clone(),
         };
-        let managed_version = self
+        let managed = self
             .config_service
-            .managed_agent_runtime_version(agent_id, &command)?;
+            .managed_agent_installation(agent_id, &command)?;
         let descriptor = self.compatibility_registry.for_agent(agent_id);
 
-        if let Some(version) = managed_version {
+        if let Some(managed) = managed {
+            let version = managed.version;
+            let install_root = managed.install_root;
             let adapter_id = descriptor
                 .map(|descriptor| descriptor.adapter_id.clone())
                 .unwrap_or_else(|| default_adapter_for_agent(agent_id));
-            let exact_descriptor = descriptor.is_some_and(|descriptor| {
+            let exact_version = descriptor.is_some_and(|descriptor| {
                 descriptor.distribution.exact_version.to_string() == version
             });
-            if exact_descriptor {
+            if exact_version {
                 let descriptor = descriptor.expect("exact descriptor is present");
                 let expected_identity = descriptor.expected_compatibility_identity();
                 let event_enricher = descriptor
                     .event_enricher_for_identity(&expected_identity)
                     .unwrap_or(AgentEventEnricherKind::Passthrough);
-                return Ok(EffectiveAdapterIdentity {
-                    adapter_id,
-                    adapter_version: version,
-                    event_enricher,
-                    compatibility_identity: expected_identity.to_string(),
-                    exact_descriptor: true,
-                });
+                match verify_managed_activation(descriptor, &install_root) {
+                    Ok(()) => {
+                        return Ok(EffectiveAdapterIdentity {
+                            adapter_id,
+                            adapter_version: version,
+                            event_enricher,
+                            compatibility_identity: expected_identity.to_string(),
+                            exact_descriptor: true,
+                            activation: AcpAdapterActivationState::Verified,
+                        });
+                    }
+                    Err(error) => {
+                        // A pinned baseline that cannot prove its own artifact
+                        // keeps the family behaviour but loses every typed
+                        // projection, quirk, and alias: those were verified for
+                        // an artifact this installation did not demonstrate.
+                        tracing::debug!(
+                            agent_id = agent_id.as_str(),
+                            adapter_version = version.as_str(),
+                            activation_code = error.code.as_str(),
+                            "managed ACP adapter activation rejected"
+                        );
+                        return Ok(EffectiveAdapterIdentity {
+                            compatibility_identity: format!("adapter={adapter_id}@{version}"),
+                            adapter_id,
+                            adapter_version: version,
+                            exact_descriptor: false,
+                            event_enricher,
+                            activation: AcpAdapterActivationState::Unverified { code: error.code },
+                        });
+                    }
+                }
             }
             // Managed installations track the remote registry, so the local
             // version routinely runs ahead of the compiled descriptor. Keep
@@ -11060,6 +11118,7 @@ impl AcpRuntimeClient {
                 adapter_version: version,
                 exact_descriptor: false,
                 event_enricher,
+                activation: AcpAdapterActivationState::NotApplicable,
             });
         }
 
@@ -11075,6 +11134,7 @@ impl AcpRuntimeClient {
                     event_enricher,
                     compatibility_identity: expected_identity.to_string(),
                     exact_descriptor: true,
+                    activation: AcpAdapterActivationState::NotApplicable,
                 }
             })
             .unwrap_or_else(|| EffectiveAdapterIdentity {
@@ -11087,6 +11147,7 @@ impl AcpRuntimeClient {
                 // whose plan arrives as an extension would otherwise render as
                 // anonymous tool cards.
                 event_enricher: agent_dialect_profile(agent_id.as_str()).event_enricher,
+                activation: AcpAdapterActivationState::NotApplicable,
             }))
     }
 
@@ -21966,6 +22027,8 @@ fn image_content_block(attachment: &ProviderTurnAttachment) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
     use vibex_agent::AgentProvider;
     use vibex_core::{
         AgentAuthenticationOperation, AgentAuthenticationOperationState, UserMessageDelivery,
@@ -22101,6 +22164,7 @@ mod tests {
         registry_agent_id: &str,
         version: &str,
         config: &AcpProviderConfig,
+        install_root: &Path,
     ) {
         let agent_id = AgentId::parse(agent_id).unwrap();
         vibex_db::AgentManagedInstallationRepository::upsert(
@@ -22122,7 +22186,7 @@ mod tests {
                     command: config.command.clone(),
                     args: config.args.clone(),
                 }),
-                install_root: Some(format!("/managed/{registry_agent_id}")),
+                install_root: Some(install_root.to_string_lossy().into_owned()),
                 updated_at_ms: 1,
             },
         )
@@ -22141,7 +22205,14 @@ mod tests {
             "/managed/node",
             vec!["/managed/claude-agent-acp.js".to_string()],
         );
-        persist_managed_runtime(&conn, "claude", "claude-acp", "0.65.0", &claude);
+        persist_managed_runtime(
+            &conn,
+            "claude",
+            "claude-acp",
+            "0.65.0",
+            &claude,
+            &dir.path().join("claude-install"),
+        );
         let identity = client
             .effective_adapter_identity(&AgentId::parse("claude").unwrap(), &claude)
             .unwrap();
@@ -22151,19 +22222,35 @@ mod tests {
             "adapter=claude-agent-acp@0.65.0"
         );
         assert!(!identity.exact_descriptor);
+        assert_eq!(
+            identity.activation,
+            AcpAdapterActivationState::NotApplicable
+        );
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
 
         let codex = test_acp_config("/managed/node", vec!["/managed/codex-acp.js".to_string()]);
-        persist_managed_runtime(&conn, "codex", "codex-acp", "2.5.0", &codex);
+        persist_managed_runtime(
+            &conn,
+            "codex",
+            "codex-acp",
+            "2.5.0",
+            &codex,
+            &dir.path().join("codex-install"),
+        );
         let identity = client
             .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
             .unwrap();
         assert_eq!(identity.adapter_version, "2.5.0");
+        // The version matches the pin, but nothing recorded that this
+        // installation is the verified artifact.
+        assert_eq!(identity.compatibility_identity, "adapter=codex-acp@2.5.0");
+        assert!(!identity.exact_descriptor);
         assert_eq!(
-            identity.compatibility_identity,
-            "adapter=codex-acp@2.5.0;runtime=@openai/codex@0.165.0"
+            identity.activation,
+            AcpAdapterActivationState::Unverified {
+                code: "acp_adapter_activation_evidence_missing".to_string(),
+            }
         );
-        assert!(identity.exact_descriptor);
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Codex);
 
         let external = test_acp_config("claude-agent-acp", Vec::new());
@@ -22171,7 +22258,84 @@ mod tests {
             .effective_adapter_identity(&AgentId::parse("claude").unwrap(), &external)
             .unwrap();
         assert!(identity.exact_descriptor);
+        assert_eq!(
+            identity.activation,
+            AcpAdapterActivationState::NotApplicable
+        );
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
+    }
+
+    #[test]
+    fn managed_activation_requires_matching_artifact_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vibex.db");
+        let mut conn = open_database(&db_path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(&db_path));
+
+        let install_root = dir.path().join("codex-install");
+        let entrypoint = "node_modules/codex-acp/dist/index.js";
+        std::fs::create_dir_all(install_root.join("node_modules/codex-acp/dist")).unwrap();
+        std::fs::write(install_root.join(entrypoint), b"launcher").unwrap();
+        let codex = test_acp_config(
+            "/managed/node",
+            vec![install_root.join(entrypoint).to_string_lossy().into_owned()],
+        );
+        persist_managed_runtime(&conn, "codex", "codex-acp", "2.5.0", &codex, &install_root);
+
+        let descriptor = crate::registry::AcpCompatibilityRegistry::builtin()
+            .unwrap()
+            .for_agent(&AgentId::parse("codex").unwrap())
+            .unwrap()
+            .clone();
+        let evidence = crate::adapter_activation::AcpAdapterActivationEvidence {
+            schema_version: crate::adapter_activation::ACP_ACTIVATION_EVIDENCE_SCHEMA_VERSION,
+            adapter_id: descriptor.adapter_id.as_str().to_string(),
+            adapter_version: "2.5.0".to_string(),
+            compatibility_identity: descriptor.expected_compatibility_identity().to_string(),
+            entrypoint: entrypoint.to_string(),
+            entrypoint_hash: format!("sha256:{:x}", Sha256::digest(b"launcher")),
+            runtime_versions: descriptor
+                .distribution
+                .runtime_dependencies
+                .iter()
+                .filter(|dependency| dependency.include_in_compatibility_identity)
+                .map(|dependency| {
+                    (
+                        dependency.package.clone(),
+                        dependency.managed_pin.to_string(),
+                    )
+                })
+                .collect(),
+            verified_at_ms: 1,
+        };
+        std::fs::write(
+            install_root.join(crate::adapter_activation::ACP_ACTIVATION_EVIDENCE_FILE),
+            serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        let identity = client
+            .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
+            .unwrap();
+        assert!(identity.exact_descriptor);
+        assert_eq!(identity.activation, AcpAdapterActivationState::Verified);
+        assert_eq!(
+            identity.compatibility_identity,
+            "adapter=codex-acp@2.5.0;runtime=@openai/codex@0.165.0"
+        );
+
+        std::fs::write(install_root.join(entrypoint), b"tampered").unwrap();
+        let identity = client
+            .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
+            .unwrap();
+        assert!(!identity.exact_descriptor);
+        assert_eq!(
+            identity.activation,
+            AcpAdapterActivationState::Unverified {
+                code: "acp_adapter_activation_artifact_drift".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -28290,6 +28454,7 @@ for line in sys.stdin:
                 OPENCODE_AGENT_ID,
                 vibex_core::OPENCODE_LAST_VERIFIED_VERSION,
                 &config,
+                std::path::Path::new("/managed/opencode"),
             );
             drop(conn);
             service
@@ -35537,7 +35702,14 @@ for line in sys.stdin:
             .unwrap();
         config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
         let conn = open_database(&fixture.db_path).unwrap();
-        persist_managed_runtime(&conn, "hermes", "hermes-acp", "0.19.0", &config);
+        persist_managed_runtime(
+            &conn,
+            "hermes",
+            "hermes-acp",
+            "0.19.0",
+            &config,
+            std::path::Path::new("/managed/hermes"),
+        );
         vibex_db::ProviderSecretReferenceRepository::replace_for_profile(
             &conn,
             &fixture.profile_id,
@@ -40132,7 +40304,14 @@ for line in sys.stdin:
             .unwrap();
         config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
         let conn = open_database(&fixture.db_path).unwrap();
-        persist_managed_runtime(&conn, "hermes", "hermes-acp", "0.19.0", &config);
+        persist_managed_runtime(
+            &conn,
+            "hermes",
+            "hermes-acp",
+            "0.19.0",
+            &config,
+            std::path::Path::new("/managed/hermes"),
+        );
         vibex_db::ProviderSecretReferenceRepository::replace_for_profile(
             &conn,
             &fixture.profile_id,
